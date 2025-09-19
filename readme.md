@@ -119,4 +119,4 @@ Chart PNG     : ./outputs/stress_RELIANCE_covid_2020.png
 ---
 
 ## 👨‍💻 Authors
-Team project for MachineHack × Groq Hackathon 2025.
+Bharat: Team Lingaro's project for MachineHack × Groq Hackathon 2025.
