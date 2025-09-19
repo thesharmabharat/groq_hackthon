@@ -2,29 +2,30 @@
 """
 StressTest AI for Indian Stocks (NSE)
 -------------------------------------
-Optimized multi‑agent prototype with portfolio support, market‑factor stress, and
-vectorized Monte Carlo — tailored for MachineHack × Groq.
+Optimized multi‑agent prototype with portfolio support, market‑factor stress,
+vectorized Monte Carlo, sentiment signal, and optional voice summaries —
+tailored for MachineHack × Groq (Financial Analysis track).
 
 What's new vs v1
 - ✅ Portfolio mode (multiple tickers + weights; equal weights by default)
 - ✅ NIFTY‑conditioned stress using a 1‑factor model (beta to market + residuals)
-- ✅ (Stub) SentimentAgent scales market shock (fear/optimism)
+- ✅ SentimentAgent: manual override, volatility‑based fear index, optional LLM headline scoring
 - ✅ Charts: PnL histogram + sample portfolio price paths
 - ✅ Vectorized simulation (matrix bootstrap) for low latency
 - ✅ Simple in‑memory Yahoo cache to avoid repeat downloads
+- ✅ Voice summary (optional TTS, saves a .wav)
 - ✅ MCP‑friendly tool wrappers; optional Groq LLM bullet summaries
 
 Examples
 --------
-python stresstest_ai.py --ticker RELIANCE --scenario covid_2020 --days 10
-python stresstest_ai.py --tickers RELIANCE,TCS,INFY --weights 0.34,0.33,0.33 --scenario gfc_2008 --days 15 --sims 8000
-python stresstest_ai.py --tickers HDFCBANK,ICICIBANK --scenario oil_2022 --days 7 --json
+python stresstest_ai_v2.py --ticker RELIANCE --scenario covid_2020 --days 10 --sims 6000 --speak
+python stresstest_ai_v2.py --tickers RELIANCE,TCS,INFY --weights 0.34,0.33,0.33 --scenario gfc_2008 --days 15 --sims 8000 --headlines_file headlines.txt --json
 
 Notes
 -----
 - NSE symbols are auto‑suffixed with ".NS" for Yahoo Finance.
-- Requires: yfinance, numpy, pandas, matplotlib. Optional: groq
-- Outputs two PNGs per run (histogram + sample paths) into ./outputs/
+- Requires: yfinance, numpy, pandas, matplotlib. Optional: groq, pyttsx3
+- Outputs three files per run: histogram PNG, paths PNG, and optional WAV.
 """
 from __future__ import annotations
 import os
@@ -45,6 +46,12 @@ try:
     from groq import Groq
 except Exception:
     Groq = None  # type: ignore
+
+# Optional TTS (offline). If unavailable, we skip gracefully.
+try:
+    import pyttsx3  # pip install pyttsx3
+except Exception:
+    pyttsx3 = None  # type: ignore
 
 # Market data (pip install yfinance)
 try:
@@ -154,9 +161,66 @@ class GroqLLMTool:
 # -----------------------------
 @dataclass
 class SentimentAgent:
-    """Stub for MCP news/Twitter; returns score in [-1, 1]."""
-    def get_sentiment_score(self, tickers: List[str]) -> float:
-        return 0.0  # neutral for now
+    """Sentiment sources (pick best available):
+    1) Manual override via env SENTIMENT_SCORE in [-1,1]
+    2) Volatility‑based fear index from recent NIFTY returns
+    3) (Optional) LLM‑based scoring of headlines passed via file/CLI
+    Output is a compact scalar in [-1, 1] used to shift market returns slightly.
+    """
+    groq: Optional[GroqLLMTool] = None
+    data_tool: YahooFinanceTool = None
+
+    def manual_override(self) -> Optional[float]:
+        v = os.environ.get("SENTIMENT_SCORE")
+        if v is None:
+            return None
+        try:
+            x = float(v)
+            return max(-1.0, min(1.0, x))
+        except Exception:
+            return None
+
+    def fear_index(self, lookback_days: int = 30, norm_period: str = "1y") -> float:
+        try:
+            recent = self.data_tool.get_full_history(MARKET_TICKER, period="6mo")["Adj Close"].pct_change().dropna()
+            long = self.data_tool.get_full_history(MARKET_TICKER, period=norm_period)["Adj Close"].pct_change().dropna()
+            recent_vol = float(recent.tail(lookback_days).std())
+            long_vol = float(long.std()) if len(long) else recent_vol
+            if long_vol == 0:
+                return 0.0
+            ratio = recent_vol / long_vol  # >1 means elevated fear
+            score = max(-1.0, min(1.0, (ratio - 1.0)))  # ~0 near normal; positive when fearful
+            return score
+        except Exception:
+            return 0.0
+
+    def llm_headline_score(self, headlines: Optional[List[str]]) -> Optional[float]:
+        if not headlines or not self.groq:
+            return None
+        joined = "\n".join(f"- {h}" for h in headlines[:12])
+        prompt = (
+            "You are a market sentiment rater. From these headlines, output a single number in [-1,1] representing bearish(-1) to bullish(+1).\n"
+            "Return ONLY the number. Headlines:\n" + joined
+        )
+        raw = self.groq.summarize(prompt)
+        try:
+            import re
+            m = re.search(r"[-+]?\d*\.?\d+", raw)
+            if not m:
+                return None
+            val = float(m.group())
+            return max(-1.0, min(1.0, val))
+        except Exception:
+            return None
+
+    def get_sentiment_score(self, tickers: List[str], headlines: Optional[List[str]] = None) -> float:
+        m = self.manual_override()
+        if m is not None:
+            return m
+        l = self.llm_headline_score(headlines)
+        if l is not None:
+            return l
+        return self.fear_index()
 
 
 @dataclass
@@ -193,35 +257,33 @@ class StressAgent:
 
     def _fit_betas(self, asset_rets: pd.DataFrame, mkt_rets: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
         """OLS betas per asset for the crisis window; returns (alpha, beta)."""
-        X = mkt_rets.values
+        mkt = mkt_rets.reindex(asset_rets.index).dropna()
+        X = mkt.values
         alphas, betas = [], []
         for col in asset_rets.columns:
-            y = asset_rets[col].reindex_like(mkt_rets).dropna()
-            x = mkt_rets.reindex_like(y).values
-            yv = y.values
-            if len(yv) < 5:
-                alphas.append(0.0); betas.append(1.0)
-                continue
-            # OLS: beta = cov/var
+            y = asset_rets[col].reindex(mkt.index).dropna().values
+            x = mkt.reindex(mkt.index[:len(y)]).values  # align length
+            if len(y) < 5:
+                alphas.append(0.0); betas.append(1.0); continue
             var_x = np.var(x, ddof=1)
-            cov_xy = np.cov(x, yv, ddof=1)[0,1] if var_x > 0 else 0.0
+            cov_xy = np.cov(x, y, ddof=1)[0,1] if var_x > 0 else 0.0
             beta = cov_xy / var_x if var_x > 0 else 1.0
-            alpha = float(np.mean(yv - beta * x))
+            alpha = float(np.mean(y - beta * x))
             alphas.append(alpha); betas.append(beta)
         return np.array(alphas, dtype=float), np.array(betas, dtype=float)
 
-    def _residual_pool(self, asset_rets: pd.DataFrame, mkt_rets: pd.Series, alphas: np.ndarray, betas: np.ndarray) -> np.ndarray:
-        resids = []
-        X = mkt_rets.values
+    def _residual_pool(self, asset_rets: pd.DataFrame, mkt_rets: pd.Series, alphas: np.ndarray, betas: np.ndarray) -> List[np.ndarray]:
+        mkt = mkt_rets.reindex(asset_rets.index).dropna()
+        X = mkt.values
+        resids: List[np.ndarray] = []
         for i, col in enumerate(asset_rets.columns):
-            y = asset_rets[col].reindex_like(mkt_rets).values
+            y = asset_rets[col].reindex(mkt.index).values
             r = y - (alphas[i] + betas[i] * X)
             r = r[~np.isnan(r)]
-            if len(r) == 0:
+            if r.size == 0:
                 r = np.array([0.0])
             resids.append(r)
-        # ragged → store as list; sampling handles per asset separately
-        return resids  # type: ignore
+        return resids
 
     def simulate_portfolio(
         self,
@@ -233,7 +295,7 @@ class StressAgent:
         sentiment_score: float,
         horizon_days: int = 10,
         sims: int = 5000,
-    ) -> Dict[str, any]:
+    ) -> Tuple[Dict[str, any], np.ndarray]:
         n_assets = len(weights)
         alphas, betas = self._fit_betas(asset_rets, mkt_rets)
         resid_pool = self._residual_pool(asset_rets, mkt_rets, alphas, betas)
@@ -247,7 +309,7 @@ class StressAgent:
         if sentiment_score != 0.0:
             M = M + sentiment_score * (np.std(mkt_vals) * 0.2)
 
-        # Build asset returns: r_i = alpha_i + beta_i*M + eps_i  (eps_i bootstrapped per asset)
+        # Asset returns: r_i = alpha_i + beta_i*M + eps_i  (eps_i bootstrapped per asset)
         A = np.zeros((sims, horizon_days, n_assets), dtype=float)
         for i in range(n_assets):
             eps_pool = resid_pool[i]
@@ -267,7 +329,7 @@ class StressAgent:
         cvar95 = float(pnl[pnl <= np.percentile(pnl, 5)].mean())
         exp = float(np.mean(pnl))
 
-        res = {
+        res: Dict[str, any] = {
             "scenario": scenario,
             "horizon_days": horizon_days,
             "sims": sims,
@@ -305,7 +367,6 @@ class StressAgent:
     @staticmethod
     def plot_paths(port_vals: np.ndarray, outfile: str, n_paths: int = 30) -> str:
         plt.figure(figsize=(8,5))
-        base0 = port_vals[0,0]
         idx = RNG.integers(0, port_vals.shape[0], size=min(n_paths, port_vals.shape[0]))
         for i in idx:
             plt.plot(port_vals[i], alpha=0.5, linewidth=1)
@@ -325,7 +386,7 @@ class Orchestrator:
     stress_agent: StressAgent
     sentiment_agent: SentimentAgent
 
-    def run(self, tickers: List[str], weights: Optional[List[float]], scenario: str, days: int, sims: int) -> Dict[str, any]:
+    def run(self, tickers: List[str], weights: Optional[List[float]], scenario: str, days: int, sims: int, headlines: Optional[List[str]] = None, speak: bool = False) -> Dict[str, any]:
         tickers = [t.upper().strip() for t in tickers]
         if weights is None:
             weights = [1.0/len(tickers)] * len(tickers)
@@ -340,8 +401,8 @@ class Orchestrator:
         asset_crisis = self.data_agent.crisis_returns(tickers, scenario)
         mkt_crisis = self.data_agent.market_crisis_returns(scenario)
 
-        # Sentiment (stub)
-        s_score = self.sentiment_agent.get_sentiment_score(tickers)
+        # Sentiment
+        s_score = self.sentiment_agent.get_sentiment_score(tickers, headlines=headlines)
 
         # Simulate
         res, port_vals = self.stress_agent.simulate_portfolio(
@@ -354,6 +415,22 @@ class Orchestrator:
             horizon_days=days,
             sims=sims,
         )
+
+        # Optional voice summary
+        wav_path = None
+        if speak:
+            to_say = res.get("llm_summary") or (
+                f"Stress results {scenario}. Expected return {res['exp_return']:.1%}. VaR ninety five {res['var95']:.1%}. C V a R ninety five {res['cvar95']:.1%}."
+            )
+            if pyttsx3 is not None:
+                try:
+                    engine = pyttsx3.init()
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    wav_path = os.path.join(PNG_DIR, f"summary_{scenario}_{ts}.wav")
+                    engine.save_to_file(to_say, wav_path)
+                    engine.runAndWait()
+                except Exception:
+                    wav_path = None
 
         # Plots
         base_val = float(np.sum(prices_now * W))
@@ -371,6 +448,8 @@ class Orchestrator:
             "price_now": prices_now.tolist(),
             "pnl_hist_png": hist_png,
             "paths_png": paths_png,
+            "sentiment_score": s_score,
+            "voice_wav": wav_path,
         })
         return res
 
@@ -388,6 +467,8 @@ def parse_args():
     p.add_argument("--scenario", required=True, choices=list(CRISIS_WINDOWS.keys()))
     p.add_argument("--days", type=int, default=10)
     p.add_argument("--sims", type=int, default=5000)
+    p.add_argument("--headlines_file", help="Path to .txt (one headline per line) or JSON list of headlines")
+    p.add_argument("--speak", action="store_true", help="Save voice summary (.wav)")
     p.add_argument("--json", action="store_true", help="Print JSON result")
     return p.parse_args()
 
@@ -399,12 +480,25 @@ def main():
     if args.weights:
         weights = [float(x) for x in args.weights.split(",")]
 
+    headlines: Optional[List[str]] = None
+    if args.headlines_file:
+        try:
+            with open(args.headlines_file, 'r', encoding='utf-8') as f:
+                txt = f.read().strip()
+                if txt.startswith('['):
+                    headlines = json.loads(txt)
+                else:
+                    headlines = [line.strip() for line in txt.splitlines() if line.strip()]
+        except Exception:
+            headlines = None
+
     try:
-        data_agent = DataAgent(YahooFinanceTool())
+        data_tool = YahooFinanceTool()
+        data_agent = DataAgent(data_tool)
         stress_agent = StressAgent(GroqLLMTool())
-        sentiment_agent = SentimentAgent()
+        sentiment_agent = SentimentAgent(groq=stress_agent.groq, data_tool=data_tool)
         orch = Orchestrator(data_agent, stress_agent, sentiment_agent)
-        result = orch.run(tickers, weights, args.scenario, args.days, args.sims)
+        result = orch.run(tickers, weights, args.scenario, args.days, args.sims, headlines=headlines, speak=args.speak)
         if args.json:
             print(json.dumps(result, indent=2))
         else:
@@ -420,8 +514,11 @@ def main():
             if 'llm_summary' in result:
                 print("--- Groq Summary ---")
                 print(result['llm_summary'])
+            print(f"Sentiment : {result['sentiment_score']:+.2f}")
             print(f"Histogram : {result['pnl_hist_png']}")
             print(f"Paths     : {result['paths_png']}")
+            if result.get('voice_wav'):
+                print(f"Voice     : {result['voice_wav']}")
             print("===============================\n")
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
